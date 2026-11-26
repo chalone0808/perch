@@ -1,0 +1,60 @@
+#!/usr/bin/env bun
+// Claude Code hook entry: `bun hook.ts <start|stop|prompt|permission>`, hook JSON on stdin.
+// Rule: never break the agent. Any failure → exit 0 with no output.
+import { existsSync, openSync } from 'node:fs'
+import { spawn } from 'node:child_process'
+import { HOME, SOCK } from './watcher'
+
+const event = process.argv[2]
+if (existsSync(`${HOME}/paused`)) process.exit(0) // pause switch: touch ~/.perch/paused
+
+const call = async (path: string, body?: unknown) => {
+  const res = await fetch(`http://perch${path}`, { unix: SOCK, method: body ? 'POST' : 'GET', body: body && JSON.stringify(body) })
+  return res.json() as Promise<any>
+}
+
+async function ensureWatcher() {
+  try { return await call('/status') } catch {}
+  const log = openSync(`${HOME}/watcher.log`, 'a')
+  spawn(process.execPath, [new URL('./watcher.ts', import.meta.url).pathname], { detached: true, stdio: ['ignore', log, log] }).unref()
+  for (let i = 0; i < 30; i++) {
+    await Bun.sleep(100)
+    try { return await call('/status') } catch {}
+  }
+}
+
+try {
+  const input = await Bun.stdin.json()
+  const session_id = input.session_id
+  // Empty for sessions launched outside `perch claude`; the watcher uses it to tell terminals apart.
+  const keys = process.env.PERCH_KEYS ?? null
+  const transcript = input.transcript_path ?? null
+  switch (event) {
+    case 'start':
+      await ensureWatcher()
+      await call('/hook/start', { session_id, cwd: input.cwd, keys, transcript, source: input.source })
+      break
+    case 'stop':
+      await call('/hook/stop', { session_id, cwd: input.cwd, text: input.last_assistant_message ?? '', keys, transcript })
+      break
+    case 'prompt':
+      await call('/hook/prompt', { session_id, cwd: input.cwd, text: input.prompt ?? '', keys, transcript })
+      break
+    case 'tool':
+      await call('/hook/tool', {
+        session_id, cwd: input.cwd, tool_name: input.tool_name, tool_input: input.tool_input, keys, transcript,
+      })
+      break
+    case 'end':
+      await call('/hook/end', { session_id, cwd: input.cwd, reason: input.reason ?? 'other', keys })
+      break
+    case 'permission': {
+      const { decision } = await call('/hook/permission', {
+        session_id, tool_name: input.tool_name, tool_input: input.tool_input, keys,
+      })
+      if (decision) console.log(JSON.stringify({ hookSpecificOutput: { hookEventName: 'PermissionRequest', decision } }))
+      break
+    }
+  }
+} catch {}
+process.exit(0)
