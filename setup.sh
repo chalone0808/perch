@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Perch laptop client installer.
 #
+#   curl -fsSL <setup-url> | bash
 #   curl -fsSL <setup-url> | bash -s -- --server https://api.example.com --code ABCD
 #
 # This repository contains the laptop client only. The relay server is in
@@ -253,6 +254,16 @@ fetch_code() { # fetch_code DEST
 
 have() { command -v "$1" >/dev/null 2>&1; }
 pkg_installed() { dpkg-query -W -f='${Status}' "$1" 2>/dev/null | grep -q 'install ok installed'; }
+
+# Reuse a Bun the user already has instead of installing a second copy under ~/.bun.
+find_bun() {
+  local p
+  if p="$(command -v bun 2>/dev/null)" && [ -x "$p" ]; then printf '%s\n' "$p"; return 0; fi
+  for p in "$HOME/.bun/bin/bun" "$HOME/.local/bin/bun" /opt/homebrew/bin/bun /usr/local/bin/bun /usr/bin/bun /home/linuxbrew/.linuxbrew/bin/bun; do
+    [ -x "$p" ] && { printf '%s\n' "$p"; return 0; }
+  done
+  return 1
+}
 local_source() { [ -n "$SOURCE" ] || { [ -n "$SELF_DIR" ] && [ -f "$SELF_DIR/server/server.ts" ]; }; }
 
 shell_rc() { # sets RC_FILE and SHELL_NAME for the invoking user
@@ -792,23 +803,29 @@ setup_client() {
   fi
 
   shell_rc
-  BUN_DIR="$HOME/.bun"
-  if [ ! -x "$BUN_DIR/bin/bun" ] && [ "$YES" != 1 ] && has_tty; then
-    while :; do
-      ask BUN_DIR "Bun install path" "$HOME/.bun"
-      case "$BUN_DIR" in
-        /*) case "$BUN_DIR" in *[!A-Za-z0-9/._-]*) warn "use letters, digits, ., _, - and /"; continue ;; esac ;;
-        *) warn "path must be absolute"; continue ;;
-      esac
-      break
-    done
+  local existing_bun=""
+  if existing_bun="$(find_bun)"; then
+    BUN="$existing_bun"
+    BUN_DIR="$(dirname "$(dirname "$BUN")")"
+  else
+    BUN_DIR="$HOME/.bun"
+    if [ "$YES" != 1 ] && has_tty; then
+      while :; do
+        ask BUN_DIR "Bun install path" "$HOME/.bun"
+        case "$BUN_DIR" in
+          /*) case "$BUN_DIR" in *[!A-Za-z0-9/._-]*) warn "use letters, digits, ., _, - and /"; continue ;; esac ;;
+          *) warn "path must be absolute"; continue ;;
+        esac
+        break
+      done
+    fi
+    case "$BUN_DIR" in /*) ;; *) die "Bun path must be absolute: $BUN_DIR" ;; esac
+    BUN="$BUN_DIR/bin/bun"
   fi
-  case "$BUN_DIR" in /*) ;; *) die "Bun path must be absolute: $BUN_DIR" ;; esac
-  BUN="$BUN_DIR/bin/bun"
 
   say "Requirements"
   if [ -x "$BUN" ]; then
-    printf 'Bun: present\n'
+    printf 'Bun: present (%s)\n' "$BUN"
   else
     printf 'Bun: install under %s\n' "$BUN_DIR"
   fi

@@ -1,6 +1,6 @@
 #!/usr/bin/env bun
 // perch claude [args...]       start claude with phone hooks attached (this launch only)
-// perch pair <server> <code>    connect this laptop to a relay (code from `bun server.ts pair machine`)
+// perch pair <server> <code>    connect this laptop to a relay (code from the phone: Settings -> Add a Laptop)
 // perch update                 git pull this client checkout, then reload the watcher
 // perch restart                reload the watcher after updating perch (agents keep running)
 // perch status                 sessions, queues, presence
@@ -154,6 +154,9 @@ switch (cmd) {
     if (previous?.direct === false) config.direct = false
     writeFileSync(`${HOME}/config.json`, JSON.stringify(config, null, 2), { mode: 0o600 })
     console.log(`paired as "${machine}", key ${fingerprint(keys.pub)}`)
+    // A running watcher keeps the config it started with. Reload it so a re-pair switches now,
+    // without making the user discover that `perch pair` alone left it on the old relay.
+    if (existsSync(SOCK)) await restartWatcher()
     break
   }
   case 'send':

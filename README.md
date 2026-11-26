@@ -30,14 +30,18 @@ Install on every computer that runs your agent (Claude Code today).
 ### One-command setup
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/chalone0808/perch/main/setup.sh \
-  | bash -s -- --server https://api.example.com --code <code>
+curl -fsSL https://raw.githubusercontent.com/chalone0808/perch/main/setup.sh | bash
 ```
 
-It installs Bun (asking where to put it if Bun is absent), clones the repository
-to `~/.perch/app`, installs a `perch` command under `<prefix>/bin`, adds the PATH
-lines to your shell rc (printed at the end; open a new shell or source it), and
-pairs with the one-time code. Without `--code`, it prints the pair command.
+It reuses an existing Bun from `PATH` or `~/.bun` and only installs Bun when
+none is found. It clones the repository to `~/.perch/app`, installs a `perch`
+command under `<prefix>/bin`, and adds the PATH lines to your shell rc (printed
+at the end; open a new shell or source it).
+
+Then pair from the phone: **Settings → Add a Laptop** shows the exact
+`perch pair …` command (single use, 10 minutes). For an unattended install that
+pairs immediately, add `--server URL --code CODE` after `bash -s --`.
+
 Options: `--prefix`, `--source PATH`, `--repo URL`, `--branch BRANCH`.
 
 ### Manual setup
@@ -47,14 +51,14 @@ git clone <repository-url> ~/.perch/app
 alias perch='bun "$HOME/.perch/app/perch.ts"'   # add to ~/.zshrc or ~/.bashrc
 ```
 
-Pair with a code from the phone or the relay:
+Pair with a code from the phone (**Settings → Add a Laptop**):
 
 ```sh
 perch pair https://api.example.com <code>
 ```
 
-This writes `~/.perch/config.json`. Then start Claude Code through Perch (the
-current adapter):
+This writes `~/.perch/config.json` and reloads a running watcher. Then start
+Claude Code through Perch (the current adapter):
 
 ```sh
 perch claude [your usual claude flags]
@@ -69,6 +73,7 @@ session and answer permission prompts.
 ```sh
 perch status                     # relay, key, direct, watcher state
 perch version                    # client and relay versions
+perch pair <server> <code>       # connect or move this laptop; reloads a running watcher
 perch direct on|off|status       # direct LAN/Tailscale transport
 perch away|home                  # pause or resume phone notifications
 perch restart                    # reload the watcher
