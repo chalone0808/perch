@@ -786,9 +786,9 @@ setup_client() {
   esac
 
   if [ -n "$SOURCE" ]; then
-    [ -f "$SOURCE/client/perch.ts" ] || die "source has no client/: $SOURCE"
-  elif [ -n "$SELF_DIR" ] && [ ! -f "$SELF_DIR/client/perch.ts" ]; then
-    die "this checkout has no client/ (use the client repository)"
+    [ -f "$SOURCE/perch.ts" ] || die "source has no perch.ts: $SOURCE"
+  elif [ -n "$SELF_DIR" ] && [ ! -f "$SELF_DIR/perch.ts" ]; then
+    die "this checkout has no perch.ts (use the client repository)"
   fi
 
   shell_rc
@@ -860,14 +860,14 @@ setup_client() {
         else
           git -C "$PREFIX" pull --ff-only
         fi
-      elif [ -f "$PREFIX/client/perch.ts" ] && [ "$(cd "$PREFIX" && pwd)" = "$SELF_DIR" ]; then
+      elif [ -f "$PREFIX/perch.ts" ] && [ "$(cd "$PREFIX" && pwd)" = "$SELF_DIR" ]; then
         printf 'using this checkout\n'
       elif [ -e "$PREFIX" ] && [ -n "$(ls -A "$PREFIX" 2>/dev/null)" ]; then
         die "$PREFIX exists and is not a git checkout"
       else
         git clone --depth 1 --branch "$BRANCH" "$REPO_URL" "$PREFIX"
       fi
-    elif [ -n "$SELF_DIR" ] && [ -f "$SELF_DIR/client/perch.ts" ]; then
+    elif [ -n "$SELF_DIR" ] && [ -f "$SELF_DIR/perch.ts" ]; then
       mkdir -p "$PREFIX"
       (cd "$SELF_DIR" && tar --exclude=.git -cf - .) | (cd "$PREFIX" && tar -xf -)
     else
@@ -875,22 +875,22 @@ setup_client() {
     fi
   fi
 
-  [ -f "$PREFIX/client/perch.ts" ] || die "this checkout has no client/ (use the client repository)"
+  [ -f "$PREFIX/perch.ts" ] || die "this checkout has no perch.ts (use the client repository)"
 
   say "Command"
   install -d -m 0755 "$PREFIX/bin"
   cat > "$PREFIX/bin/perch" <<EOF
 #!/bin/sh
-exec "$BUN" "$PREFIX/client/perch.ts" "\$@"
+exec "$BUN" "$PREFIX/perch.ts" "\$@"
 EOF
   chmod 0755 "$PREFIX/bin/perch"
   add_path "$PREFIX/bin"
 
   if [ -n "$SERVER" ] && [ -n "$CODE" ]; then
-    "$BUN" "$PREFIX/client/perch.ts" pair "$SERVER" "$CODE"
+    "$BUN" "$PREFIX/perch.ts" pair "$SERVER" "$CODE"
   else
     todo 'Pair this computer with a code from the phone (Settings -> Add a Laptop):'
-    todo '  "%s" "%s" pair <server> <code>' "$BUN" "$PREFIX/client/perch.ts"
+    todo '  "%s" "%s" pair <server> <code>' "$BUN" "$PREFIX/perch.ts"
   fi
   todo 'Start Claude Code with:'
   todo '  perch claude'

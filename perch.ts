@@ -88,7 +88,7 @@ switch (cmd) {
     if (before === after) { console.log('already up to date'); break }
     const changed = git('diff', '--name-only', before, after).stdout.toString().split('\n')
     console.log(git('log', '--oneline', `${before}..${after}`).stdout.toString().trim())
-    if (changed.some((f) => f.startsWith('client/')) && existsSync(SOCK)) await restartWatcher()
+    if (changed.some((f) => f.endsWith('.ts')) && existsSync(SOCK)) await restartWatcher()
     // a relay installed by scripts/setup.sh runs from this checkout too
     const ok = (...cmd: string[]) => { try { return Bun.spawnSync(cmd, { stdout: 'ignore', stderr: 'ignore' }).exitCode === 0 } catch { return false } }
     if (changed.some((f) => f.startsWith('server/')) && ok('systemctl', '--user', 'cat', 'perch-relay')) {

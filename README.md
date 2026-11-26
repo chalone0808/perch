@@ -12,9 +12,7 @@ envelopes it cannot read.
 This repository contains the laptop client. The relay is in the
 `chalone0808/perch-relay` repository. The iOS app is not in this repository.
 
-```
-client/   perch CLI, agent adapter (Claude Code today), and tests
-```
+The client code is at the repository root; its tests are in `test/`.
 
 The client needs [Bun](https://bun.sh) and, for the current adapter, [Claude
 Code](https://claude.com/claude-code) on `PATH`.
@@ -46,7 +44,7 @@ Options: `--prefix`, `--source PATH`, `--repo URL`, `--branch BRANCH`.
 
 ```sh
 git clone <repository-url> ~/.perch/app
-alias perch='bun "$HOME/.perch/app/client/perch.ts"'   # add to ~/.zshrc or ~/.bashrc
+alias perch='bun "$HOME/.perch/app/perch.ts"'   # add to ~/.zshrc or ~/.bashrc
 ```
 
 Pair with a code from the phone or the relay:
@@ -94,7 +92,7 @@ edit `config.json` by hand; re-pairing rewrites it.
 ## Tests
 
 ```sh
-cd client && bun test test/
+bun test test/
 ```
 
 ## License
