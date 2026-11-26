@@ -1,9 +1,10 @@
 #!/usr/bin/env bun
 // perch claude [args...]       start claude with phone hooks attached (this launch only)
 // perch pair <server> <code>    connect this laptop to a relay (code from `bun server.ts pair machine`)
-// perch update                 git pull this checkout, then reload the watcher (and a local relay)
+// perch update                 git pull this client checkout, then reload the watcher
 // perch restart                reload the watcher after updating perch (agents keep running)
 // perch status                 sessions, queues, presence
+// perch version                client and relay versions
 // perch direct on|off|status   turn the direct phone endpoint on or off, or show its state
 // perch away | home            presence: away = approvals go to the phone
 // perch send <session> <text>  inject a phone message locally (testing without a server)
@@ -13,6 +14,7 @@ import { hostname } from 'node:os'
 import { HOME, SOCK } from './watcher'
 import { Keys, fingerprint } from './e2e'
 import { relayFetch } from './net'
+import { VERSION, PROTOCOL } from './version'
 
 const [cmd, ...args] = process.argv.slice(2)
 // How long a phone approval stays answerable. Seven days by default; override with
@@ -75,9 +77,17 @@ switch (cmd) {
     if (!(await restartWatcher())) process.exit(1)
     break
   case 'update': {
-    // Pull the latest perch into this checkout, then reload what runs from it.
-    const repo = new URL('..', import.meta.url).pathname
+    // Pull the latest client into this checkout, then reload what runs from it. The relay is a
+    // separate install and updates from its own repository.
+    const repo = import.meta.dir
     const git = (...a: string[]) => Bun.spawnSync(['git', '-C', repo, ...a], { stdout: 'pipe', stderr: 'pipe' })
+    // A `--source` install is a copied tree with no .git. Without this check, git can silently
+    // walk up to an unrelated parent repository and pull that instead.
+    const inside = git('rev-parse', '--is-inside-work-tree')
+    if (!existsSync(`${repo}/.git`) || inside.exitCode !== 0 || inside.stdout.toString().trim() !== 'true') {
+      console.error(`${repo} is not a git checkout; rerun the installer to update`)
+      process.exit(1)
+    }
     const before = git('rev-parse', 'HEAD').stdout.toString().trim()
     const pull = git('pull', '--ff-only')
     if (pull.exitCode !== 0) {
@@ -89,18 +99,40 @@ switch (cmd) {
     const changed = git('diff', '--name-only', before, after).stdout.toString().split('\n')
     console.log(git('log', '--oneline', `${before}..${after}`).stdout.toString().trim())
     if (changed.some((f) => f.endsWith('.ts')) && existsSync(SOCK)) await restartWatcher()
-    // a relay installed by scripts/setup.sh runs from this checkout too
-    const ok = (...cmd: string[]) => { try { return Bun.spawnSync(cmd, { stdout: 'ignore', stderr: 'ignore' }).exitCode === 0 } catch { return false } }
-    if (changed.some((f) => f.startsWith('server/')) && ok('systemctl', '--user', 'cat', 'perch-relay')) {
-      console.log(ok('systemctl', '--user', 'restart', 'perch-relay') ? 'relay restarted' : 'relay restart failed: systemctl --user status perch-relay')
-    }
-    if (changed.some((f) => f.startsWith('app/'))) console.log('the iPhone app changed: rebuild it (scripts/setup-ios.sh)')
     console.log('running `perch claude` sessions pick up hook changes when restarted')
     break
   }
   case 'status':
     console.log(JSON.stringify(await call('/status'), null, 2))
     break
+  case 'version': {
+    let local = await callOrNull('/version')
+    if (!local) {
+      const running = (await callOrNull('/status')) != null
+      local = {
+        name: 'perch',
+        version: VERSION,
+        protocol: PROTOCOL,
+        running,
+        note: running
+          ? 'the running watcher is older and does not report a version; restart it'
+          : 'the watcher is not running; this is the installed client',
+      }
+    }
+    const cfg = readConfig()
+    let relay: any = null
+    if (cfg?.server) {
+      const server = String(cfg.server).replace(/\/$/, '')
+      try {
+        const res = await relayFetch(`${server}/v1/version`)
+        relay = res.ok ? await res.json() : { server, error: `HTTP ${res.status}` }
+      } catch (e) {
+        relay = { server, error: (e as Error).message }
+      }
+    }
+    console.log(JSON.stringify({ client: local, relay }, null, 2))
+    break
+  }
   case 'away':
   case 'home':
     await call('/inject', { type: 'presence', body: { away: cmd === 'away' } })
@@ -146,7 +178,7 @@ switch (cmd) {
     break
   }
   default:
-    console.error('usage: perch claude [args] | pair <server> <code> | direct on|off|status | update | restart | status | away | home | send <session> <text>')
+    console.error('usage: perch claude [args] | pair <server> <code> | direct on|off|status | update | restart | status | version | away | home | send <session> <text>')
     process.exit(1)
 }
 

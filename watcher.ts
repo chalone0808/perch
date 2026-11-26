@@ -8,6 +8,7 @@ import { dirname, join } from 'node:path'
 import { randomUUID } from 'node:crypto'
 import { Keys, E2E_VERSION, fingerprint, isPub, directRequestProof, directResponseProof, sameProof, type Version } from './e2e'
 import { relayFetch } from './net'
+import { VERSION, PROTOCOL } from './version'
 
 export const HOME = process.env.PERCH_HOME ?? `${process.env.HOME}/.perch`
 export const SOCK = `${HOME}/watcher.sock`
@@ -658,6 +659,9 @@ export class Watcher {
 
   status() {
     return {
+      version: VERSION,
+      protocol: PROTOCOL,
+      ...(this.machine ? { machine: this.machine } : {}),
       away: this.away,
       outbox: (this.db.query('select count(*) n from outbox').get() as { n: number }).n,
       sessions: this.db.query(`
@@ -744,7 +748,7 @@ export class Watcher {
         const res = await relayFetch(`${cfg.server}/v1/sync`, {
           method: 'POST',
           headers: { authorization: `Bearer ${cfg.token}`, 'content-type': 'application/json' },
-          body: JSON.stringify({ machine: cfg.machine ?? hostname(), pubkey: keys.pub, e2e: E2E_VERSION, after: Number(this.get('cursor') ?? 0), outbox, wait: polling ? 25 : 0, direct }),
+          body: JSON.stringify({ machine: cfg.machine ?? hostname(), pubkey: keys.pub, e2e: E2E_VERSION, version: VERSION, protocol: PROTOCOL, after: Number(this.get('cursor') ?? 0), outbox, wait: polling ? 25 : 0, direct }),
           signal: AbortSignal.any([ctrl.signal, AbortSignal.timeout(40_000)]),
         })
         if (!res.ok) throw new Error(`sync HTTP ${res.status}`)
@@ -948,6 +952,8 @@ export function serve(w: Watcher, unix = SOCK) {
     idleTimeout: 0, // waiters long-poll for hours
     async fetch(req) {
       const path = new URL(req.url).pathname
+      if (req.method === 'GET' && path === '/version')
+        return json({ name: 'perch', version: VERSION, protocol: PROTOCOL, machine: w.machine ?? hostname(), pid: process.pid })
       if (req.method === 'GET' && path === '/status') return json(w.status())
       const b = req.method === 'POST' ? await req.json() : {}
       switch (path) {

@@ -2,8 +2,9 @@ import { test, expect } from 'bun:test'
 import { appendFileSync, mkdtempSync, mkdirSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { Watcher, discoverCommands, retryDelay, toDecision, toolSummary, taskNote, type Msg } from '../watcher'
+import { Watcher, discoverCommands, retryDelay, serve, toDecision, toolSummary, taskNote, type Msg } from '../watcher'
 import { Keys, fingerprint } from '../e2e'
+import { VERSION, PROTOCOL } from '../version'
 
 const msg = (type: string, body: any, session_id = 's1', id = crypto.randomUUID()): Msg => ({ id, type, session_id, body, ts: '' })
 const out = (w: Watcher) => (w.db.query('select json from outbox order by seq').all() as { json: string }[]).map((r) => JSON.parse(r.json))
@@ -22,6 +23,20 @@ const typing = ({ away = true } = {}) => {
   return { w, sent }
 }
 const PASTE = (t: string) => `\x1b[200~${t}\x1b[201~`
+
+test('version and protocol are reported locally and in sync', async () => {
+  const w = new Watcher(':memory:', { home: HOME })
+  expect(w.status()).toMatchObject({ version: VERSION, protocol: PROTOCOL })
+  w.machine = 'test-machine'
+  const sock = join(mkdtempSync(join(tmpdir(), 'perch-sock-')), 'watcher.sock')
+  const server = serve(w, sock)
+  try {
+    const res = await fetch('http://perch/version', { unix: sock })
+    expect(await res.json()).toMatchObject({
+      name: 'perch', version: VERSION, protocol: PROTOCOL, machine: 'test-machine',
+    })
+  } finally { server.stop(true) }
+})
 
 test('failed syncs back off exponentially and cap out at a minute', () => {
   expect(retryDelay(1, () => 0)).toBe(1_000) // 2s base, half-jittered
@@ -420,6 +435,8 @@ test('sync: encrypted both ways; unsealed or stranger messages are dropped', asy
   expect(sent).toEqual([PASTE('from phone'), '\r'])
   expect(seen[0].outbox).toEqual([]) // no phone keys yet: nothing to seal for
   expect(seen[0].pubkey).toBe(machine.pub)
+  expect(seen[0].version).toBe(VERSION)
+  expect(seen[0].protocol).toBe(PROTOCOL)
   const reply = seen[1].outbox.find((m: Msg) => m.type === 'agent_reply')
   expect(JSON.stringify(reply.body)).not.toContain('done')
   expect(phone.open('up', reply, [machine.pub])?.body).toEqual({ cwd: '/x', text: 'done' })

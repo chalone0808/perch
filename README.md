@@ -68,10 +68,11 @@ session and answer permission prompts.
 
 ```sh
 perch status                     # relay, key, direct, watcher state
+perch version                    # client and relay versions
 perch direct on|off|status       # direct LAN/Tailscale transport
 perch away|home                  # pause or resume phone notifications
 perch restart                    # reload the watcher
-perch update                     # git pull this checkout and reload
+perch update                     # git pull this client checkout and reload
 perch send <session> <text>      # inject a phone message locally
 ```
 
@@ -80,7 +81,23 @@ edit `config.json` by hand; re-pairing rewrites it.
 
 ## Updating
 
-`perch update` pulls the checkout and reloads the watcher.
+`perch update` pulls this client checkout and reloads the watcher. The relay is
+a separate install with its own repository; update it by rerunning the relay's
+`setup.sh` on the server (or `git pull` and restart `perch-relay` for a manual
+checkout). Updating one does not update the other.
+
+## Versions
+
+The client reports its `version` and wire `protocol` at startup:
+
+```sh
+perch version
+```
+
+That prints the running watcher's version and, when paired, the relay's
+`GET /v1/version` response. The phone also sees each computer's version through
+the normal relay sync and warns when a computer's protocol is too old for the
+app.
 
 ## Security
 
