@@ -1,6 +1,7 @@
 #!/usr/bin/env bun
 // perch claude [args...]       start claude with phone hooks attached (this launch only)
 // perch pair <server> <code>    connect this laptop to a relay (code from the phone: Settings -> Add a Laptop)
+// perch unpair                 remove this laptop from the relay (local history stays here)
 // perch update                 git pull this client checkout, then reload the watcher
 // perch restart                reload the watcher after updating perch (agents keep running)
 // perch status                 sessions, queues, presence
@@ -159,6 +160,36 @@ switch (cmd) {
     if (existsSync(SOCK)) await restartWatcher()
     break
   }
+  case 'unpair': {
+    const cfg = readConfig()
+    if (!cfg?.server || !cfg?.token) { console.error('not paired'); process.exit(1) }
+    const server = String(cfg.server).replace(/\/$/, '')
+    let res: Response
+    try {
+      res = await relayFetch(`${server}/v1/unpair`, {
+        method: 'POST',
+        headers: { authorization: `Bearer ${cfg.token}`, 'content-type': 'application/json' },
+        body: '{}',
+      })
+    } catch (e) {
+      console.error(`unpair failed: ${(e as Error).message}`)
+      process.exit(1)
+    }
+    // A phone can revoke this computer first. The relay then answers 401, which means the token is
+    // already dead: clear the local side too instead of leaving a pairing that can never sync.
+    const alreadyGone = res.status === 401
+    if (!res.ok && !alreadyGone) {
+      const out = (await res.json().catch(() => ({}))) as any
+      console.error('unpair failed:', out.error ?? `HTTP ${res.status}`)
+      process.exit(1)
+    }
+    await stopWatcher()
+    rmSync(`${HOME}/config.json`, { force: true })
+    console.log(alreadyGone
+      ? 'this computer was already unpaired; local config removed'
+      : `unpaired "${cfg.machine ?? hostname()}"; keys and local history stay on this computer`)
+    break
+  }
   case 'send':
     if (args.length < 2) { console.error('usage: perch send <session_id> <text>'); process.exit(1) }
     await call('/inject', { type: 'prompt', session_id: args[0], body: { text: args.slice(1).join(' ') } })
@@ -181,7 +212,7 @@ switch (cmd) {
     break
   }
   default:
-    console.error('usage: perch claude [args] | pair <server> <code> | direct on|off|status | update | restart | status | version | away | home | send <session> <text>')
+    console.error('usage: perch claude [args] | pair <server> <code> | unpair | direct on|off|status | update | restart | status | version | away | home | send <session> <text>')
     process.exit(1)
 }
 
@@ -193,20 +224,7 @@ async function restartWatcher() {
   if (status?.pending_approvals) {
     console.error(`${status.pending_approvals} approval(s) waiting: they fall back to the terminal prompt.`)
   }
-  const pidFile = `${HOME}/watcher.pid`
-  let pid = 0
-  try { pid = Number(readFileSync(pidFile, 'utf8')) } catch {}
-  // The pid can be stale (watcher SIGKILLed) and reused by another process: only kill our own.
-  const isWatcher = (p: number) => {
-    try { return Bun.spawnSync(['ps', '-p', String(p), '-o', 'command=']).stdout.toString().includes('watcher.ts') } catch { return false }
-  }
-  if (pid && isWatcher(pid)) {
-    try { process.kill(pid) } catch {}
-    const alive = () => { try { process.kill(pid, 0); return true } catch { return false } }
-    for (let i = 0; i < 50 && alive(); i++) await Bun.sleep(100)
-  } else {
-    rmSync(`${HOME}/watcher.lock`, { recursive: true, force: true }) // stale lock would keep a new watcher from starting
-  }
+  await stopWatcher()
   const log = openSync(`${HOME}/watcher.log`, 'a')
   spawn(process.execPath, [new URL('./watcher.ts', import.meta.url).pathname], {
     detached: true, stdio: ['ignore', log, log],
@@ -220,4 +238,24 @@ async function restartWatcher() {
   }
   console.log(up ? 'watcher restarted' : `watcher did not start; see ${HOME}/watcher.log`)
   return up
+}
+
+/// Stop the running watcher, if it is ours. Agents keep running; their hooks lose the phone until
+/// a new watcher starts. A stale pid (SIGKILLed watcher) is never killed because the pid can be
+/// reused; only a process whose command line names watcher.ts is touched.
+async function stopWatcher(): Promise<boolean> {
+  const pidFile = `${HOME}/watcher.pid`
+  let pid = 0
+  try { pid = Number(readFileSync(pidFile, 'utf8')) } catch {}
+  const isWatcher = (p: number) => {
+    try { return Bun.spawnSync(['ps', '-p', String(p), '-o', 'command=']).stdout.toString().includes('watcher.ts') } catch { return false }
+  }
+  if (!pid || !isWatcher(pid)) {
+    rmSync(`${HOME}/watcher.lock`, { recursive: true, force: true }) // stale lock would keep a new watcher from starting
+    return false
+  }
+  try { process.kill(pid) } catch {}
+  const alive = () => { try { process.kill(pid, 0); return true } catch { return false } }
+  for (let i = 0; i < 50 && alive(); i++) await Bun.sleep(100)
+  return true
 }

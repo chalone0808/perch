@@ -74,12 +74,18 @@ session and answer permission prompts.
 perch status                     # relay, key, direct, watcher state
 perch version                    # client and relay versions
 perch pair <server> <code>       # connect or move this laptop; reloads a running watcher
+perch unpair                     # remove this laptop from the relay; local history stays
 perch direct on|off|status       # direct LAN/Tailscale transport
 perch away|home                  # pause or resume phone notifications
 perch restart                    # reload the watcher
 perch update                     # git pull this client checkout and reload
 perch send <session> <text>      # inject a phone message locally
 ```
+
+Unpair on the phone (**Settings → Computers**, swipe left) or with
+`perch unpair` here. Both revoke this computer's relay token; its keys and local
+history stay on the computer, and it can be paired again with a new code. The
+phone can only unpair a computer, never another phone.
 
 Config and state live in `~/.perch` (`config.json`, keys, hooks, socket). Do not
 edit `config.json` by hand; re-pairing rewrites it.
