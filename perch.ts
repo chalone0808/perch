@@ -9,6 +9,7 @@
 // perch direct on|off|status   turn the direct phone endpoint on or off, or show its state
 // perch away | home            presence: away = approvals go to the phone
 // perch send <session> <text>  inject a phone message locally (testing without a server)
+import { Database } from 'bun:sqlite'
 import { mkdirSync, writeFileSync, chmodSync, rmSync, readFileSync, openSync, existsSync } from 'node:fs'
 import { spawn } from 'node:child_process'
 import { hostname } from 'node:os'
@@ -155,9 +156,12 @@ switch (cmd) {
     if (previous?.direct === false) config.direct = false
     writeFileSync(`${HOME}/config.json`, JSON.stringify(config, null, 2), { mode: 0o600 })
     console.log(`paired as "${machine}", key ${fingerprint(keys.pub)}`)
-    // A running watcher keeps the config it started with. Reload it so a re-pair switches now,
-    // without making the user discover that `perch pair` alone left it on the old relay.
-    if (existsSync(SOCK)) await restartWatcher()
+    // Pairing creates a new relay device row with its own delivery cursor. The old watcher's
+    // cursor can be ahead of everything that row has served, which silently stalls relay
+    // delivery (messages then arrive only over direct). Reset it before the watcher starts.
+    // A running watcher keeps the config it started with, so restart it too.
+    if (existsSync(SOCK)) await restartWatcher({ resetCursorStore: true })
+    else resetCursor()
     break
   }
   case 'unpair': {
@@ -216,7 +220,7 @@ switch (cmd) {
     process.exit(1)
 }
 
-async function restartWatcher() {
+async function restartWatcher({ resetCursorStore = false } = {}) {
   // Reload the watcher after `git pull`. Agents keep running; a pending approval falls back to
   // the terminal prompt, so the command warns first.
   mkdirSync(HOME, { recursive: true, mode: 0o700 })
@@ -225,6 +229,7 @@ async function restartWatcher() {
     console.error(`${status.pending_approvals} approval(s) waiting: they fall back to the terminal prompt.`)
   }
   await stopWatcher()
+  if (resetCursorStore) resetCursor()
   const log = openSync(`${HOME}/watcher.log`, 'a')
   spawn(process.execPath, [new URL('./watcher.ts', import.meta.url).pathname], {
     detached: true, stdio: ['ignore', log, log],
@@ -238,6 +243,20 @@ async function restartWatcher() {
   }
   console.log(up ? 'watcher restarted' : `watcher did not start; see ${HOME}/watcher.log`)
   return up
+}
+
+/// The watcher's relay cursor belongs to one device row. Pairing replaces that row, so a cursor
+/// from the old relay can be past everything the new row has served. Starting again at zero makes
+/// the relay resend its retained inbox; the watcher's inbox table drops ids it has already seen.
+function resetCursor() {
+  if (!existsSync(`${HOME}/perch.db`)) return
+  const db = new Database(`${HOME}/perch.db`)
+  try {
+    db.run('create table if not exists kv (k text primary key, v text)')
+    db.run("insert into kv (k, v) values ('cursor', '0') on conflict(k) do update set v = '0'")
+  } finally {
+    db.close()
+  }
 }
 
 /// Stop the running watcher, if it is ours. Agents keep running; their hooks lose the phone until
