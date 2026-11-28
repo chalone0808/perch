@@ -9,11 +9,10 @@
 // perch direct on|off|status   turn the direct phone endpoint on or off, or show its state
 // perch away | home            presence: away = approvals go to the phone
 // perch send <session> <text>  inject a phone message locally (testing without a server)
-import { Database } from 'bun:sqlite'
 import { mkdirSync, writeFileSync, chmodSync, rmSync, readFileSync, openSync, existsSync } from 'node:fs'
 import { spawn } from 'node:child_process'
 import { hostname } from 'node:os'
-import { HOME, SOCK } from './watcher'
+import { HOME, SOCK, resetCursor } from './watcher'
 import { Keys, fingerprint } from './e2e'
 import { relayFetch } from './net'
 import { VERSION, PROTOCOL } from './version'
@@ -146,13 +145,15 @@ switch (cmd) {
     const machine = hostname()
     mkdirSync(HOME, { recursive: true, mode: 0o700 })
     const keys = Keys.load(`${HOME}/key.json`)
-    const res = await relayFetch(`${server.replace(/\/$/, '')}/v1/pair`, { method: 'POST', body: JSON.stringify({ code, name: machine, pubkey: keys.pub }) })
+    const res = await relayFetch(`${server.replace(/\/$/, '')}/v1/pair`, { method: 'POST', body: JSON.stringify({ code, name: machine, pubkey: keys.pub, protocol: PROTOCOL }) })
     const out = (await res.json()) as any
     if (!res.ok || out.kind !== 'machine') { console.error('pairing failed:', out.error ?? `not a machine code (${out.kind})`); process.exit(1) }
     mkdirSync(HOME, { recursive: true, mode: 0o700 })
     // Re-pairing keeps a direct opt-out: pairing again should only replace the relay credentials.
     const previous = readConfig()
     const config: any = { server: server.replace(/\/$/, ''), token: out.token, machine }
+    // The relay mints a device id per pairing; old relays don't return one (name fallback).
+    if (typeof out.device_id === 'string') config.device_id = out.device_id
     if (previous?.direct === false) config.direct = false
     writeFileSync(`${HOME}/config.json`, JSON.stringify(config, null, 2), { mode: 0o600 })
     console.log(`paired as "${machine}", key ${fingerprint(keys.pub)}`)
@@ -243,20 +244,6 @@ async function restartWatcher({ resetCursorStore = false } = {}) {
   }
   console.log(up ? 'watcher restarted' : `watcher did not start; see ${HOME}/watcher.log`)
   return up
-}
-
-/// The watcher's relay cursor belongs to one device row. Pairing replaces that row, so a cursor
-/// from the old relay can be past everything the new row has served. Starting again at zero makes
-/// the relay resend its retained inbox; the watcher's inbox table drops ids it has already seen.
-function resetCursor() {
-  if (!existsSync(`${HOME}/perch.db`)) return
-  const db = new Database(`${HOME}/perch.db`)
-  try {
-    db.run('create table if not exists kv (k text primary key, v text)')
-    db.run("insert into kv (k, v) values ('cursor', '0') on conflict(k) do update set v = '0'")
-  } finally {
-    db.close()
-  }
 }
 
 /// Stop the running watcher, if it is ours. Agents keep running; their hooks lose the phone until

@@ -137,3 +137,33 @@ test('a phone that reads e2e 2 gets the session sealed inside, both ways', async
   expect(body.inbox[0]).not.toHaveProperty('session_id')
   expect(phone.openMessage('up', body.inbox[0], [machine.pub])).toMatchObject({ session_id: 's1', machine: 'mac', body: { text: 'done' } })
 })
+
+test('a machine id addresses this exact pairing; the name is the legacy fallback', async () => {
+  const { w, phone, machine, handle, request } = setup()
+  w.machineId = 'dev_mac'
+  const m = msg('prompt', { text: 'by id' })
+  m.machine = 'not-mac'
+  m.machine_id = 'dev_mac'
+  let res = await handle(request({ after: 0, outbox: [{ ...m, body: phone.seal('down', m, [machine.pub]) }], wait: 0 }), '192.168.1.9')
+  expect((await res.json()).acked).toEqual([m.id])
+  // A different id is refused even when the display name matches.
+  const other = msg('prompt', { text: 'other' })
+  other.machine = 'mac'
+  other.machine_id = 'dev_other'
+  res = await handle(request({ after: 0, outbox: [{ ...other, body: phone.seal('down', other, [machine.pub]) }], wait: 0 }), '192.168.1.9')
+  expect((await res.json()).acked).toEqual([])
+  // A phone that predates ids still addresses by name.
+  const legacy = msg('prompt', { text: 'by name' })
+  legacy.machine = 'mac'
+  res = await handle(request({ after: 0, outbox: [{ ...legacy, body: phone.seal('down', legacy, [machine.pub]) }], wait: 0 }), '192.168.1.9')
+  expect((await res.json()).acked).toEqual([legacy.id])
+})
+
+test('direct inbox entries carry the machine id when this laptop has one', async () => {
+  const { w, phone, machine, handle, request } = setup()
+  w.machineId = 'dev_mac'
+  w.emit('agent_reply', 's1', { text: 'done' })
+  const body = (await (await handle(request({ after: 0, wait: 0 }), '192.168.1.9')).json()) as any
+  expect(body.inbox[0]).toMatchObject({ machine: 'mac', machine_id: 'dev_mac' })
+  expect(phone.open('up', body.inbox[0], [machine.pub])?.body).toEqual({ text: 'done' })
+})

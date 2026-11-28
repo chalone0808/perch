@@ -270,11 +270,27 @@ export function discoverCommands(cwd: string, home = process.env.HOME ?? homedir
   return [...found.values()].sort((a, b) => a.name.localeCompare(b.name))
 }
 
+/// The relay cursor belongs to one device row. Pairing replaces that row, so starting again at
+/// zero makes the relay resend its retained inbox; the watcher's inbox table drops repeats. The
+/// branded token from the old row is meaningless too, so it is cleared with the number.
+export function resetCursor() {
+  if (!existsSync(`${HOME}/perch.db`)) return
+  const db = new Database(`${HOME}/perch.db`)
+  try {
+    db.run('create table if not exists kv (k text primary key, v text)')
+    db.run("insert into kv (k, v) values ('cursor', '0') on conflict(k) do update set v = '0'")
+    db.run("delete from kv where k = 'cursor_token'")
+  } finally { db.close() }
+}
+
 export class Watcher {
   db: Database
   // sessions where a permission dialog may be open in the terminal with no phone request behind it
   // (the hook timed out); typing there could answer the dialog, so hold messages until the turn ends
   blocked = new Set<string>()
+  // Claude Code's own terminal dialogs (plan approval, the question picker) also swallow typed
+  // input. A PreToolUse for one marks the session here until the dialog closes.
+  modal = new Set<string>()
   // Sessions with a turn in flight. A permission hook can outlive its turn (answering a question
   // in the terminal leaves the hook waiting until it expires), and an expiry after Stop must not
   // block typing for a turn that already ended.
@@ -289,6 +305,8 @@ export class Watcher {
   directWaiters = new Set<() => void>()
   addresses = directAddrs // overridable in tests so hints are deterministic
   machine?: string
+  // The relay's per-pairing identity; routing and direct filtering use it, the name stays a label.
+  machineId?: string
   key?: string // this machine's public key, once syncing
   keyDelay = 100 // ms between key chunks, so Enter isn't swallowed into a paste
   // the command list last sent per session, so routine hooks don't repeat it
@@ -456,6 +474,7 @@ export class Watcher {
     if (row && row.keys === null) return // already ended
     this.active.delete(session_id)
     this.blocked.delete(session_id)
+    this.modal.delete(session_id)
     this.db.run('update sessions set keys = null where id = ?', [session_id])
     const queued = this.db.query(`select id from inbox where session_id = ? and state = 'queued'`).all(session_id) as { id: string }[]
     if (queued.length) {
@@ -476,7 +495,8 @@ export class Watcher {
     // A prompt submitted at the terminal means any dialog handed back to it was resolved; queued
     // phone messages can be typed (Claude Code queues mid-turn input natively) without waiting
     // for the turn to end.
-    if (this.blocked.delete(session_id)) void this.flush(session_id)
+    const wasBlocked = this.blocked.delete(session_id)
+    if (this.modal.delete(session_id) || wasBlocked) void this.flush(session_id)
     const note = taskNote(text)
     if (note) return void this.emit('task_note', session_id, { cwd, ...note }, this.away)
     this.emit('user_prompt', session_id, { cwd, text })
@@ -490,6 +510,13 @@ export class Watcher {
     this.active.add(session_id) // tools run only inside a turn
     this.texts(session_id, transcript) // what the agent said before this tool call
     this.db.run('update sessions set cwd = ?, updated = ? where id = ?', [cwd, new Date().toISOString(), session_id])
+    // These tools open a terminal dialog that does not accept a pasted prompt; hold phone
+    // messages until it closes (the next ordinary tool, Stop, or a prompt submitted at the keyboard).
+    if (tool_name === 'ExitPlanMode' || tool_name === 'AskUserQuestion') {
+      this.modal.add(session_id)
+    } else if (this.modal.delete(session_id)) {
+      void this.flush(session_id)
+    }
     this.emit('activity', session_id, { cwd, ...toolSummary(tool_name, tool_input) })
   }
 
@@ -501,6 +528,7 @@ export class Watcher {
     this.refreshCommands(session_id, cwd)
     this.active.delete(session_id)
     this.blocked.delete(session_id) // turn over: no dialog can be open
+    this.modal.delete(session_id)
     return this.flush(session_id)
   }
 
@@ -605,9 +633,9 @@ export class Watcher {
     }
   }
 
-  // Typing is only safe when nobody is at the keyboard (away) and no permission dialog can be open.
+  // Typing is only safe when nobody is at the keyboard (away) and no terminal dialog can be open.
   canType(session: string) {
-    return this.away && !this.blocked.has(session) && ![...this.perms.values()].some((p) => p.session === session)
+    return this.away && !this.modal.has(session) && !this.blocked.has(session) && ![...this.perms.values()].some((p) => p.session === session)
   }
 
   // Deliver queued phone messages by typing them into the session, like the user would.
@@ -662,6 +690,7 @@ export class Watcher {
       version: VERSION,
       protocol: PROTOCOL,
       ...(this.machine ? { machine: this.machine } : {}),
+      ...(this.machineId ? { machine_id: this.machineId } : {}),
       away: this.away,
       outbox: (this.db.query('select count(*) n from outbox').get() as { n: number }).n,
       sessions: this.db.query(`
@@ -722,7 +751,10 @@ export class Watcher {
     return v ? JSON.parse(v) : null
   }
 
-  async sync(cfg: { server: string; token: string; machine?: string }, keys: Keys) {
+  async sync(cfg: { server: string; token: string; machine?: string; device_id?: string }, keys: Keys) {
+    // The id can come from the pair response, the sync response, or (after an upgrade) the kv
+    // store. It is only used for the new protocol fields; old relays never send it.
+    this.machineId = cfg.device_id ?? this.machineId ?? this.get('device_id') ?? undefined
     let ctrl = new AbortController()
     let polling = false
     let failures = 0
@@ -745,15 +777,17 @@ export class Watcher {
       const addrs = this.directPort && phones?.length ? this.addresses() : []
       const direct = this.directPort && addrs.length ? { port: this.directPort, addrs } : null
       try {
+        const cursorToken = this.get('cursor_token')
         const res = await relayFetch(`${cfg.server}/v1/sync`, {
           method: 'POST',
           headers: { authorization: `Bearer ${cfg.token}`, 'content-type': 'application/json' },
-          body: JSON.stringify({ machine: cfg.machine ?? hostname(), pubkey: keys.pub, e2e: E2E_VERSION, version: VERSION, protocol: PROTOCOL, after: Number(this.get('cursor') ?? 0), outbox, wait: polling ? 25 : 0, direct }),
+          body: JSON.stringify({ machine: cfg.machine ?? hostname(), pubkey: keys.pub, e2e: E2E_VERSION, version: VERSION, protocol: PROTOCOL, after: Number(this.get('cursor') ?? 0), ...(cursorToken ? { cursor_token: cursorToken } : {}), outbox, wait: polling ? 25 : 0, direct }),
           signal: AbortSignal.any([ctrl.signal, AbortSignal.timeout(40_000)]),
         })
         if (!res.ok) throw new Error(`sync HTTP ${res.status}`)
-        const { acked, inbox, cursor, phones: listed } = (await res.json()) as {
+        const { acked, inbox, cursor, phones: listed, cursor_token: nextToken, device_id: nextDeviceId } = (await res.json()) as {
           acked: string[]; inbox: Msg[]; cursor: number; phones?: { name: string; pubkey: string | null; e2e?: number }[]
+          cursor_token?: string; device_id?: string
         }
         for (const id of acked) this.db.run('delete from outbox where id = ?', [id])
         const now = (listed ?? []).filter((p): p is { name: string; pubkey: string; e2e?: number } => !!p.pubkey)
@@ -769,6 +803,14 @@ export class Watcher {
           else console.error(new Date().toISOString(), `dropped ${m.type} ${m.id}: not encrypted by a paired phone (update the app?)`)
         }
         this.set('cursor', String(cursor))
+        // The relay brands the cursor with its own id and this device row; a new relay or a
+        // re-pair changes the token, and a stale one is rebased server-side. Keep the numeric
+        // cursor too so an old relay (no token field) still works.
+        if (typeof nextToken === 'string' && nextToken) this.set('cursor_token', nextToken)
+        if (typeof nextDeviceId === 'string' && nextDeviceId) {
+          this.machineId = nextDeviceId
+          this.set('device_id', nextDeviceId)
+        }
         failures = 0
       } catch (e) {
         if (ctrl.signal.aborted) continue
@@ -851,7 +893,11 @@ export function directHandler(
     const acked: string[] = []
     for (const m of Array.isArray(body.outbox) ? body.outbox.slice(0, 100) : []) {
       if (!m || typeof m.id !== 'string' || m.id.length > 64 || !DIRECT_TYPES.has(m.type)) continue
-      if (m.machine !== opts.machine) continue
+      // One exact pairing: a machine_id, when present, must match this laptop's id; the name is
+      // only the legacy fallback for old phones.
+      if (m.machine_id != null) {
+        if (m.machine_id !== w.machineId) continue
+      } else if (m.machine !== opts.machine) continue
       if (m.session_id != null && typeof m.session_id !== 'string') continue
       const opened = opts.keys.openMessage('down', m, phoneKeys)
       if (!opened) continue
@@ -871,7 +917,11 @@ export function directHandler(
         cursor = row.seq
         const m = JSON.parse(row.json)
         if (Array.isArray(m.to) && m.to.length && !m.to.includes(phone)) continue
-        inbox.push({ ...opts.keys.sealMessage('up', m, [phone], w.formatFor([phone])), machine: opts.machine })
+        inbox.push({
+          ...opts.keys.sealMessage('up', m, [phone], w.formatFor([phone])),
+          machine: opts.machine,
+          ...(w.machineId ? { machine_id: w.machineId } : {}),
+        })
       }
       return { inbox, cursor }
     }
@@ -1011,6 +1061,7 @@ if (import.meta.main) {
     const keys = Keys.load(`${HOME}/key.json`)
     w.key = keys.pub
     w.machine = cfg.machine ?? hostname()
+    w.machineId = cfg.device_id ?? w.get('device_id') ?? undefined
     w.directService = new DirectService(w, w.machine, keys)
     if (cfg.direct !== false) {
       try { w.directService.start() } catch (e) {

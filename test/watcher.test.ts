@@ -694,3 +694,54 @@ test('text between tool calls reaches the phone once, the final reply once', asy
   const replies = out(w).filter((m) => m.type === 'agent_reply').map((m) => [m.body.text, !!m.body.partial])
   expect(replies).toEqual([['Let me look first.', true], ['Found it, fixing.', true], ['Done.', false]])
 })
+
+test('prompts wait out a plan dialog and flush when it closes', async () => {
+  const { w, sent } = typing()
+  w.activity({ session_id: 's1', cwd: '/x', tool_name: 'ExitPlanMode', tool_input: {}, keys: '/tmp/k.sock' })
+  w.receive(msg('prompt', { text: 'held' }))
+  await settle()
+  const state = () => (w.db.query(`select state from inbox where type = 'prompt'`).get() as any).state
+  expect(sent).toEqual([]) // the dialog would swallow a pasted prompt
+  expect(state()).toBe('queued')
+  // The dialog closed and an ordinary tool runs: queued input is safe again.
+  w.activity({ session_id: 's1', cwd: '/x', tool_name: 'Bash', tool_input: {}, keys: '/tmp/k.sock' })
+  await settle()
+  expect(sent).toEqual([PASTE('held'), '\r'])
+  expect(state()).toBe('delivered')
+})
+
+test('a question picker holds prompts until the turn ends', async () => {
+  const { w, sent } = typing()
+  w.activity({ session_id: 's1', cwd: '/x', tool_name: 'AskUserQuestion', tool_input: {}, keys: '/tmp/k.sock' })
+  w.receive(msg('prompt', { text: 'later' }))
+  await settle()
+  expect(sent).toEqual([])
+  await w.stop({ session_id: 's1', cwd: '/x', text: '', keys: '/tmp/k.sock' })
+  expect(sent).toEqual([PASTE('later'), '\r'])
+})
+
+test('sync stores the relay cursor token and device id, then sends them back', async () => {
+  const { generateKeyPairSync } = await import('node:crypto')
+  const machine = new Keys(generateKeyPairSync('x25519').privateKey.export({ format: 'jwk' }) as any)
+  const w = new Watcher(':memory:', { home: HOME })
+  const seen: any[] = []
+  const server = Bun.serve({
+    port: 0,
+    async fetch(req) {
+      seen.push(await req.json())
+      if (seen.length === 1) return Response.json({ acked: [], inbox: [], cursor: 5, phones: [], cursor_token: 'r:d:5', device_id: 'dev_abc' })
+      await Bun.sleep(50)
+      return Response.json({ acked: [], inbox: [], cursor: 5, phones: [] })
+    },
+  })
+  w.sync({ server: `http://localhost:${server.port}`, token: 't' }, machine)
+  while (seen.length < 2) await Bun.sleep(5)
+  server.stop(true)
+  expect(seen[0].protocol).toBe(2)
+  expect(seen[0].cursor_token).toBeUndefined()
+  expect(seen[1].cursor_token).toBe('r:d:5')
+  expect(seen[1].after).toBe(5)
+  expect(w.machineId).toBe('dev_abc')
+  expect(w.get('device_id')).toBe('dev_abc')
+  expect(w.get('cursor_token')).toBe('r:d:5')
+})
