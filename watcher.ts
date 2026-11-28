@@ -296,6 +296,32 @@ export class Watcher {
   // block typing for a turn that already ended.
   active = new Set<string>()
   perms = new Map<string, { session: string; tool: string; input: unknown; resolve: (d: Decision | null) => void }>()
+  // Does origin/main contain a commit this checkout does not? Only then is an update useful:
+  // local commits on top are not a "new version", and a source install has no git to update from.
+  async checkForUpdate() {
+    const dir = this.updateDir
+    try {
+      if (!existsSync(`${dir}/.git`)) return
+      // Async git: a slow fetch must not block the watcher's long-polls.
+      const git = async (args: string[]) => {
+        const p = Bun.spawn(['git', '-C', dir, ...args], { stdout: 'pipe', stderr: 'pipe' })
+        const [code, out] = await Promise.all([p.exited, new Response(p.stdout).text()])
+        return { code, out }
+      }
+      if ((await git(['fetch', '--quiet', 'origin', 'main'])).code !== 0) return // offline: keep the last check
+      const head = (await git(['rev-parse', 'HEAD'])).out.trim()
+      const remote = (await git(['rev-parse', 'origin/main'])).out.trim()
+      if (!head || !remote) return
+      const available = head !== remote && (await git(['merge-base', '--is-ancestor', head, remote])).code === 0
+      this.clientUpdate = {
+        available,
+        latest: available ? remote.slice(0, 8) : null,
+        checked: Date.now(),
+      }
+      this.set('client_update', JSON.stringify(this.clientUpdate))
+    } catch {}
+  }
+
   // Polled permission requests: the DB row is the source of truth; waiters let the current short
   // request return the moment the phone answers.
   permWaiters = new Map<string, Set<(decision: Decision | null, expired?: boolean) => void>>()
@@ -311,6 +337,9 @@ export class Watcher {
   machine?: string
   // The relay's per-pairing identity; routing and direct filtering use it, the name stays a label.
   machineId?: string
+  // The laptop's own check for a newer client, reported to phones; null until checked.
+  clientUpdate: { available: boolean; latest: string | null; checked: number } | null = null
+  updateDir = import.meta.dir
   key?: string // this machine's public key, once syncing
   keyDelay = 100 // ms between key chunks, so Enter isn't swallowed into a paste
   // the command list last sent per session, so routine hooks don't repeat it
@@ -714,6 +743,25 @@ export class Watcher {
         this.perms.delete(requestId)
         return p.resolve(toDecision(p.tool, p.input, m.body))
       }
+      case 'update': {
+        const reply = (ok: boolean, error?: string) =>
+          this.emit('update_result', s, { ref: m.id, ok, ...(error ? { error } : {}) })
+        if (Date.now() - Number(this.get('last_update') ?? 0) < 5 * 60_000) return reply(false, 'already updated recently')
+        if (!existsSync(`${this.updateDir}/.git`)) return reply(false, 'this perch is not a git checkout; update it manually')
+        const pull = Bun.spawnSync(['git', '-C', this.updateDir, 'pull', '--ff-only'], { stdout: 'pipe', stderr: 'pipe' })
+        if (pull.exitCode !== 0) {
+          const detail = (pull.stderr.toString().trim().split('\n').pop() ?? '').slice(0, 200)
+          return reply(false, detail || 'git pull failed')
+        }
+        this.set('last_update', String(Date.now()))
+        reply(true)
+        // This watcher still runs the old modules; restart into the pulled checkout. The result
+        // above is already in the outbox, so the next watcher delivers it.
+        Bun.spawn([process.execPath, `${this.updateDir}/perch.ts`, 'restart'], {
+          detached: true, stdio: ['ignore', 'ignore', 'ignore'],
+        }).unref()
+        return
+      }
       case 'interrupt':
         return void this.type(s, ['\x1b']).then((ok) => this.emit('interrupted', s, { ref: m.id, ok })) // Esc
       case 'command': {
@@ -905,7 +953,7 @@ export class Watcher {
         const res = await relayFetch(`${cfg.server}/v1/sync`, {
           method: 'POST',
           headers: { authorization: `Bearer ${cfg.token}`, 'content-type': 'application/json' },
-          body: JSON.stringify({ machine: cfg.machine ?? hostname(), pubkey: keys.pub, e2e: E2E_VERSION, version: VERSION, protocol: PROTOCOL, after: Number(this.get('cursor') ?? 0), ...(cursorToken ? { cursor_token: cursorToken } : {}), outbox, wait: polling ? 25 : 0, direct }),
+          body: JSON.stringify({ machine: cfg.machine ?? hostname(), pubkey: keys.pub, e2e: E2E_VERSION, version: VERSION, protocol: PROTOCOL, ...(this.clientUpdate ? { update: this.clientUpdate } : {}), after: Number(this.get('cursor') ?? 0), ...(cursorToken ? { cursor_token: cursorToken } : {}), outbox, wait: polling ? 25 : 0, direct }),
           signal: AbortSignal.any([ctrl.signal, AbortSignal.timeout(40_000)]),
         })
         if (!res.ok) throw new Error(`sync HTTP ${res.status}`)
@@ -949,7 +997,7 @@ export class Watcher {
 export type DirectAddr = { host: string; network: 'lan' | 'tailscale' }
 export type DirectInfo = { port: number; addrs: DirectAddr[] }
 
-const DIRECT_TYPES = new Set(['prompt', 'command', 'decision', 'interrupt', 'presence'])
+const DIRECT_TYPES = new Set(['prompt', 'command', 'decision', 'interrupt', 'presence', 'update'])
 
 /// Private IPv4 addresses a phone can reach directly. Loopback, link-local and public addresses
 /// are never advertised.
@@ -1176,6 +1224,9 @@ if (import.meta.main) {
   try { unlinkSync(SOCK) } catch {}
   const w = new Watcher(`${HOME}/perch.db`)
   w.reconcile()
+  try { const saved = w.get('client_update'); if (saved) w.clientUpdate = JSON.parse(saved) } catch {}
+  void w.checkForUpdate()
+  setInterval(() => void w.checkForUpdate(), 6 * 3600_000)
   w.recoverPermissions()
   setInterval(() => w.expireStalePermissions(), 5_000)
   serve(w)

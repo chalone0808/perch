@@ -724,6 +724,7 @@ test('sync stores the relay cursor token and device id, then sends them back', a
   const { generateKeyPairSync } = await import('node:crypto')
   const machine = new Keys(generateKeyPairSync('x25519').privateKey.export({ format: 'jwk' }) as any)
   const w = new Watcher(':memory:', { home: HOME })
+  w.clientUpdate = { available: true, latest: 'abc12345', checked: 1 }
   const seen: any[] = []
   const server = Bun.serve({
     port: 0,
@@ -738,6 +739,7 @@ test('sync stores the relay cursor token and device id, then sends them back', a
   while (seen.length < 2) await Bun.sleep(5)
   server.stop(true)
   expect(seen[0].protocol).toBe(PROTOCOL)
+  expect(seen[0].update).toEqual({ available: true, latest: 'abc12345', checked: 1 })
   expect(seen[0].cursor_token).toBeUndefined()
   expect(seen[1].cursor_token).toBe('r:d:5')
   expect(seen[1].after).toBe(5)
@@ -813,4 +815,14 @@ test('a prompt sent instead denies a polled approval', async () => {
   expect((await w.startPermission({
     session_id: 's1', tool_name: 'Bash', tool_input: {}, request_id: 'req-5',
   })).decision).toEqual({ behavior: 'deny', message: 'use git instead' })
+})
+
+test('an update request is refused outside a git checkout', async () => {
+  const { w } = typing()
+  w.updateDir = mkdtempSync(join(tmpdir(), 'perch-update-'))
+  w.receive(msg('update', {}))
+  await settle()
+  const result = out(w).find((m) => m.type === 'update_result')
+  expect(result?.body).toMatchObject({ ok: false })
+  expect(String(result?.body.error)).toContain('not a git checkout')
 })
