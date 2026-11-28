@@ -25,25 +25,24 @@ const permissionSeconds = (() => {
   return Number.isFinite(n) && n > 0 ? Math.min(Math.floor(n), 2_147_483) : 7 * 24 * 3600
 })()
 
-/// Ask in short requests, reusing one request id. A lost reply, a Bun idle timeout, or a watcher
-/// restart just means the next request re-asks; the phone card stays the same one.
+/// Ask in one-minute requests, reusing one request id. A lost reply, a timeout, or a watcher
+/// restart just means the next request re-asks; the phone card stays the same one. After a
+/// request that produced no decision, wait a jittered 1-10s before asking again.
 async function permissionByPolling(req: {
   session_id: string; tool_name: unknown; tool_input: unknown; keys: string | null
 }): Promise<any | null> {
   const request_id = crypto.randomUUID()
   const deadline = Date.now() + permissionSeconds * 1000
   while (Date.now() < deadline) {
-    let answered = false
     try {
-      const res = await call('/hook/permission', { ...req, request_id, poll: true }, { timeout: 30_000 })
-      answered = true
+      const res = await call('/hook/permission', { ...req, request_id, poll: true }, { timeout: 75_000 })
       if (res.request_id == null) return null // home: the terminal prompt handles it
       if (res.decision) return res.decision
       if (res.status === 'expired') return null
     } catch {}
-    // The watcher is down or restarting: back off briefly, then ask again. A successful
-    // "pending" already waited server-side, so it can be followed immediately.
-    if (!answered) await Bun.sleep(2_000)
+    // The server held it for a minute and had no answer, or the request failed outright:
+    // spread retries over 1-10s so a recovering watcher is not hammered.
+    await Bun.sleep(1_000 + Math.floor(Math.random() * 9_001))
   }
   return null
 }

@@ -785,7 +785,7 @@ test('a polled request expires when its hook stops asking, and stays expired', a
   const { w } = typing()
   w.permWaitMs = 5
   await w.startPermission({ session_id: 's1', tool_name: 'Bash', tool_input: {}, request_id: 'req-3' })
-  w.db.run('update pending_perms set last_poll = ? where id = ?', [Date.now() - 120_000, 'req-3'])
+  w.db.run('update pending_perms set last_poll = ? where id = ?', [Date.now() - 200_000, 'req-3'])
   w.expireStalePermissions()
   expect(out(w).find((m) => m.type === 'request_expired')?.body).toEqual({ request_id: 'req-3' })
   expect(await w.startPermission({

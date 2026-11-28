@@ -299,7 +299,7 @@ export class Watcher {
   // Polled permission requests: the DB row is the source of truth; waiters let the current short
   // request return the moment the phone answers.
   permWaiters = new Map<string, Set<(decision: Decision | null, expired?: boolean) => void>>()
-  permWaitMs = 20_000
+  permWaitMs = 60_000
   away: boolean
   home: string // where user-level skills and commands live (tests pass a temp directory)
   onOutbox = () => {}
@@ -616,13 +616,14 @@ export class Watcher {
     for (const done of [...(this.permWaiters.get(id) ?? [])]) done(decision, expired)
   }
 
-  // A hook re-asks every permWaitMs. Missing a whole minute means it is gone (cancelled, the
-  // machine slept, the process died): close the phone card and keep the id as a tombstone so a
-  // late retry cannot create a second one. Decided/expired rows are kept briefly for that retry.
+  // A hook re-asks every permWaitMs plus 1-10s of jitter. Missing two whole minutes means it is
+  // gone (cancelled, the machine slept, the process died): close the phone card and keep the id
+  // as a tombstone so a late retry cannot create a second one. Decided/expired rows are kept
+  // briefly for that retry.
   expireStalePermissions(now = Date.now()) {
     const stale = this.db.query(
       'select id, session_id from pending_perms where decision is null and expired = 0 and last_poll < ?',
-    ).all(now - 60_000) as { id: string; session_id: string }[]
+    ).all(now - 120_000) as { id: string; session_id: string }[]
     for (const r of stale) {
       this.db.run('update pending_perms set expired = 1, decided_at = ? where id = ?', [now, r.id])
       this.blocked.add(r.session_id)
