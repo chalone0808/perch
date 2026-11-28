@@ -537,6 +537,7 @@ export class Watcher {
     this.active.add(req.session_id) // a request exists only inside a turn
     if (!this.away) return Promise.resolve(null) // home: normal terminal prompt
     const request_id = randomUUID()
+    const started = Date.now()
     this.emit('needs_attention', req.session_id, { request_id, tool_name: req.tool_name, tool_input: req.tool_input })
     return new Promise((resolve) => {
       this.perms.set(request_id, { session: req.session_id, tool: req.tool_name, input: req.tool_input, resolve })
@@ -545,6 +546,7 @@ export class Watcher {
         // and close the card on the phone instead of leaving it pending forever
         if (this.perms.delete(request_id)) {
           if (this.active.has(req.session_id)) this.blocked.add(req.session_id)
+          console.error(new Date().toISOString(), `permission ${request_id} ended after ${Math.round((Date.now() - started) / 1000)}s without a decision`)
           this.emit('request_expired', req.session_id, { request_id })
         }
       })

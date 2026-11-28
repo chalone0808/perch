@@ -8,8 +8,14 @@ import { HOME, SOCK } from './watcher'
 const event = process.argv[2]
 if (existsSync(`${HOME}/paused`)) process.exit(0) // pause switch: touch ~/.perch/paused
 
-const call = async (path: string, body?: unknown) => {
-  const res = await fetch(`http://perch${path}`, { unix: SOCK, method: body ? 'POST' : 'GET', body: body && JSON.stringify(body) })
+const call = async (path: string, body?: unknown, opts: { timeout?: number } = {}) => {
+  const res = await fetch(`http://perch${path}`, {
+    unix: SOCK,
+    method: body ? 'POST' : 'GET',
+    body: body && JSON.stringify(body),
+    // Bun's fetch closes a socket idle for 5 minutes by default; 0 disables that idle timer.
+    ...(opts.timeout === undefined ? {} : { timeout: opts.timeout }),
+  })
   return res.json() as Promise<any>
 }
 
@@ -49,9 +55,11 @@ try {
       await call('/hook/end', { session_id, cwd: input.cwd, reason: input.reason ?? 'other', keys })
       break
     case 'permission': {
+      // A phone answer can wait hours. Without timeout: 0, Bun's 5-minute idle timer closes this
+      // request and the watcher reports "expired" long before Claude Code's hook timeout.
       const { decision } = await call('/hook/permission', {
         session_id, tool_name: input.tool_name, tool_input: input.tool_input, keys,
-      })
+      }, { timeout: 0 })
       if (decision) console.log(JSON.stringify({ hookSpecificOutput: { hookEventName: 'PermissionRequest', decision } }))
       break
     }
