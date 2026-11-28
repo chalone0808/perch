@@ -19,6 +19,35 @@ const call = async (path: string, body?: unknown, opts: { timeout?: number } = {
   return res.json() as Promise<any>
 }
 
+// Same default as the hook timeout written by `perch claude` (7 days).
+const permissionSeconds = (() => {
+  const n = Number(process.env.PERCH_PERMISSION_TIMEOUT)
+  return Number.isFinite(n) && n > 0 ? Math.min(Math.floor(n), 2_147_483) : 7 * 24 * 3600
+})()
+
+/// Ask in short requests, reusing one request id. A lost reply, a Bun idle timeout, or a watcher
+/// restart just means the next request re-asks; the phone card stays the same one.
+async function permissionByPolling(req: {
+  session_id: string; tool_name: unknown; tool_input: unknown; keys: string | null
+}): Promise<any | null> {
+  const request_id = crypto.randomUUID()
+  const deadline = Date.now() + permissionSeconds * 1000
+  while (Date.now() < deadline) {
+    let answered = false
+    try {
+      const res = await call('/hook/permission', { ...req, request_id, poll: true }, { timeout: 30_000 })
+      answered = true
+      if (res.request_id == null) return null // home: the terminal prompt handles it
+      if (res.decision) return res.decision
+      if (res.status === 'expired') return null
+    } catch {}
+    // The watcher is down or restarting: back off briefly, then ask again. A successful
+    // "pending" already waited server-side, so it can be followed immediately.
+    if (!answered) await Bun.sleep(2_000)
+  }
+  return null
+}
+
 async function ensureWatcher() {
   try { return await call('/status') } catch {}
   const log = openSync(`${HOME}/watcher.log`, 'a')
@@ -55,11 +84,19 @@ try {
       await call('/hook/end', { session_id, cwd: input.cwd, reason: input.reason ?? 'other', keys })
       break
     case 'permission': {
-      // A phone answer can wait hours. Without timeout: 0, Bun's 5-minute idle timer closes this
-      // request and the watcher reports "expired" long before Claude Code's hook timeout.
-      const { decision } = await call('/hook/permission', {
-        session_id, tool_name: input.tool_name, tool_input: input.tool_input, keys,
-      }, { timeout: 0 })
+      await ensureWatcher()
+      let protocol = 0
+      try { protocol = Number((await call('/version')).protocol) || 0 } catch {}
+      let decision: any = null
+      if (protocol >= 3) {
+        decision = await permissionByPolling({ session_id, tool_name: input.tool_name, tool_input: input.tool_input, keys })
+      } else {
+        // Older watcher: one blocking request. timeout: 0 disables Bun's 5-minute idle timer, or
+        // it would close the request long before Claude Code's hook timeout.
+        decision = (await call('/hook/permission', {
+          session_id, tool_name: input.tool_name, tool_input: input.tool_input, keys,
+        }, { timeout: 0 })).decision
+      }
       if (decision) console.log(JSON.stringify({ hookSpecificOutput: { hookEventName: 'PermissionRequest', decision } }))
       break
     }

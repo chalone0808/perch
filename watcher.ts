@@ -296,6 +296,10 @@ export class Watcher {
   // block typing for a turn that already ended.
   active = new Set<string>()
   perms = new Map<string, { session: string; tool: string; input: unknown; resolve: (d: Decision | null) => void }>()
+  // Polled permission requests: the DB row is the source of truth; waiters let the current short
+  // request return the moment the phone answers.
+  permWaiters = new Map<string, Set<(decision: Decision | null, expired?: boolean) => void>>()
+  permWaitMs = 20_000
   away: boolean
   home: string // where user-level skills and commands live (tests pass a temp directory)
   onOutbox = () => {}
@@ -330,6 +334,10 @@ export class Watcher {
       create table if not exists outbox (seq integer primary key autoincrement, id text unique, json text);
       create table if not exists inbox (id text primary key, session_id text, type text, body text, state text);
       create table if not exists sessions (id text primary key, cwd text, keys text, updated text);
+      create table if not exists pending_perms (
+        id text primary key, session_id text not null, tool text, input text,
+        created integer not null, last_poll integer not null,
+        decision text, decided_at integer, expired integer not null default 0);
       create table if not exists kv (k text primary key, v text);`)
     this.away = this.get('away') === '1'
   }
@@ -476,6 +484,14 @@ export class Watcher {
     this.blocked.delete(session_id)
     this.modal.delete(session_id)
     this.db.run('update sessions set keys = null where id = ?', [session_id])
+    const endedAt = Date.now()
+    for (const p of this.db.query(
+      'select id from pending_perms where session_id = ? and decision is null and expired = 0',
+    ).all(session_id) as { id: string }[]) {
+      this.db.run('update pending_perms set expired = 1, decided_at = ? where id = ?', [endedAt, p.id])
+      this.wakePermission(p.id, null, true)
+      this.emit('request_expired', session_id, { request_id: p.id })
+    }
     const queued = this.db.query(`select id from inbox where session_id = ? and state = 'queued'`).all(session_id) as { id: string }[]
     if (queued.length) {
       this.db.run(`update inbox set state = 'failed' where session_id = ? and state = 'queued'`, [session_id])
@@ -553,6 +569,77 @@ export class Watcher {
     })
   }
 
+  // New hooks re-ask every permWaitMs with the same request id instead of holding one request
+  // open. The row survives a watcher restart, so the next request picks the same card up rather
+  // than creating a second one; a hook that stops asking is expired by expireStalePermissions.
+  async startPermission(req: {
+    session_id: string; tool_name?: unknown; tool_input?: unknown; keys?: string | null
+    request_id?: unknown; signal?: AbortSignal
+  }) {
+    this.claim(req.session_id, req.keys ?? null)
+    this.active.add(req.session_id) // a request exists only inside a turn
+    if (!this.away) return { request_id: null } // home: the terminal's own prompt
+    const id = typeof req.request_id === 'string' && req.request_id.length <= 64 ? req.request_id : randomUUID()
+    const now = Date.now()
+    const fresh = this.db.run(
+      `insert or ignore into pending_perms (id, session_id, tool, input, created, last_poll) values (?, ?, ?, ?, ?, ?)`,
+      [id, req.session_id, String(req.tool_name ?? ''), JSON.stringify(req.tool_input ?? null), now, now],
+    ).changes
+    if (fresh) this.emit('needs_attention', req.session_id, { request_id: id, tool_name: req.tool_name, tool_input: req.tool_input })
+    else this.db.run('update pending_perms set last_poll = ? where id = ?', [now, id])
+    const row = this.db.query('select decision, expired from pending_perms where id = ?').get(id) as
+      { decision: string | null; expired: number } | null
+    if (!row) return { request_id: id, status: 'expired' }
+    if (row.expired) return { request_id: id, status: 'expired' }
+    if (row.decision) return { request_id: id, decision: JSON.parse(row.decision) }
+    return await new Promise<{ request_id: string; decision?: Decision; status?: string }>((resolve) => {
+      const done = (decision: Decision | null, expired = false) => {
+        clearTimeout(timer)
+        const set = this.permWaiters.get(id)
+        set?.delete(done)
+        if (set && !set.size) this.permWaiters.delete(id)
+        resolve(expired
+          ? { request_id: id, status: 'expired' }
+          : decision
+            ? { request_id: id, decision }
+            : { request_id: id, status: 'pending' })
+      }
+      const timer = setTimeout(() => done(null), this.permWaitMs)
+      const set = this.permWaiters.get(id) ?? new Set()
+      set.add(done)
+      this.permWaiters.set(id, set)
+      req.signal?.addEventListener('abort', () => done(null))
+    })
+  }
+
+  private wakePermission(id: string, decision: Decision | null, expired = false) {
+    for (const done of [...(this.permWaiters.get(id) ?? [])]) done(decision, expired)
+  }
+
+  // A hook re-asks every permWaitMs. Missing a whole minute means it is gone (cancelled, the
+  // machine slept, the process died): close the phone card and keep the id as a tombstone so a
+  // late retry cannot create a second one. Decided/expired rows are kept briefly for that retry.
+  expireStalePermissions(now = Date.now()) {
+    const stale = this.db.query(
+      'select id, session_id from pending_perms where decision is null and expired = 0 and last_poll < ?',
+    ).all(now - 60_000) as { id: string; session_id: string }[]
+    for (const r of stale) {
+      this.db.run('update pending_perms set expired = 1, decided_at = ? where id = ?', [now, r.id])
+      this.blocked.add(r.session_id)
+      this.wakePermission(r.id, null, true)
+      this.emit('request_expired', r.session_id, { request_id: r.id })
+    }
+    this.db.run('delete from pending_perms where decided_at is not null and decided_at < ?', [now - 10 * 60_000])
+  }
+
+  // Called once when the watcher starts: a hook may still be polling from before the restart, so
+  // pending rows get a fresh grace period before the first stale sweep.
+  recoverPermissions() {
+    const now = Date.now()
+    this.db.run('update pending_perms set last_poll = ? where decision is null and expired = 0', [now])
+    this.expireStalePermissions(now)
+  }
+
   // Hand pending approvals back to the terminal: the hook returns no decision, so Claude Code
   // shows its normal prompt. Typing stays blocked (like a timed-out hook) until the turn ends.
   releasePermissions() {
@@ -561,6 +648,16 @@ export class Watcher {
       if (this.active.has(p.session)) this.blocked.add(p.session)
       p.resolve(null)
       this.emit('request_expired', p.session, { request_id })
+    }
+    const now = Date.now()
+    const pending = this.db.query(
+      'select id, session_id from pending_perms where decision is null and expired = 0',
+    ).all() as { id: string; session_id: string }[]
+    for (const r of pending) {
+      this.db.run('update pending_perms set expired = 1, decided_at = ? where id = ?', [now, r.id])
+      if (this.active.has(r.session_id)) this.blocked.add(r.session_id)
+      this.wakePermission(r.id, null, true)
+      this.emit('request_expired', r.session_id, { request_id: r.id })
     }
   }
 
@@ -574,6 +671,18 @@ export class Watcher {
     const s = m.session_id!
     switch (m.type) {
       case 'prompt': {
+        const waiting = this.db.query(
+          'select id from pending_perms where session_id = ? and decision is null and expired = 0 order by created limit 1',
+        ).get(s) as { id: string } | null
+        if (waiting) {
+          // a message while an approval is pending means "no, do this instead"
+          const decision: Decision = { behavior: 'deny', message: String(m.body.text) }
+          this.db.run('update pending_perms set decision = ?, decided_at = ? where id = ?', [JSON.stringify(decision), Date.now(), waiting.id])
+          this.wakePermission(waiting.id, decision)
+          this.db.run(`update inbox set state = 'delivered' where id = ?`, [m.id])
+          this.emit('delivered', s, { ids: [m.id] })
+          return
+        }
         const perm = [...this.perms].find(([, p]) => p.session === s)
         if (perm) {
           // a message while an approval is pending means "no, do this instead"
@@ -587,11 +696,21 @@ export class Watcher {
         return void this.flush(s)
       }
       case 'decision': {
-        const p = this.perms.get(m.body.request_id)
-        // Already answered at the terminal or timed out: tell the phone its answer was too late,
-        // so the card doesn't keep showing a decision the laptop never applied.
+        if (typeof m.body.request_id !== 'string') return
+        const requestId = m.body.request_id
+        const polled = this.db.query('select tool, input, expired from pending_perms where id = ?').get(requestId) as
+          { tool: string | null; input: string | null; expired: number } | null
+        if (polled) {
+          // Already expired at the terminal or by a timeout: tell the phone its answer is too late.
+          if (polled.expired) return this.emit('decision_result', s, { ref: m.id, ok: false, error: 'request expired' })
+          const decision = toDecision(polled.tool ?? '', polled.input ? JSON.parse(polled.input) : null, m.body)
+          this.db.run('update pending_perms set decision = ?, decided_at = ? where id = ? and expired = 0', [JSON.stringify(decision), Date.now(), requestId])
+          this.wakePermission(requestId, decision)
+          return
+        }
+        const p = this.perms.get(requestId)
         if (!p) return this.emit('decision_result', s, { ref: m.id, ok: false, error: 'request expired' })
-        this.perms.delete(m.body.request_id)
+        this.perms.delete(requestId)
         return p.resolve(toDecision(p.tool, p.input, m.body))
       }
       case 'interrupt':
@@ -700,7 +819,9 @@ export class Watcher {
           (select count(*) from inbox i where i.session_id = s.id and i.state = 'queued') queued
         from sessions s order by s.updated desc`).all(),
       blocked: [...this.blocked],
-      pending_approvals: this.perms.size,
+      pending_approvals: this.perms.size + (this.db.query(
+        'select count(*) n from pending_perms where decision is null and expired = 0',
+      ).get() as { n: number }).n,
       ...(this.key ? { key: fingerprint(this.key) } : {}),
       direct: this.directService?.status() ?? { enabled: false, port: null, addrs: [] },
       phones: (this.phones() ?? []).map((p) => ({ name: p.name, key: fingerprint(p.pubkey) })),
@@ -1014,7 +1135,10 @@ export function serve(w: Watcher, unix = SOCK) {
         case '/hook/prompt': return json(w.userPrompt(b) ?? {})
         case '/hook/tool': return json(w.activity(b) ?? {})
         case '/hook/end': return json({ ok: w.endFromHook(b) })
-        case '/hook/permission': return json({ decision: await w.permission(b, req.signal) })
+        case '/hook/permission':
+          return b?.poll === true
+            ? json(await w.startPermission({ ...b, signal: req.signal }))
+            : json({ decision: await w.permission(b, req.signal) })
         case '/inject': return json(w.receive({ id: randomUUID(), ts: new Date().toISOString(), ...b }) ?? {})
         case '/direct': {
           if (req.method !== 'POST') return json({ error: 'POST only' }, { status: 405 })
@@ -1051,6 +1175,8 @@ if (import.meta.main) {
   try { unlinkSync(SOCK) } catch {}
   const w = new Watcher(`${HOME}/perch.db`)
   w.reconcile()
+  w.recoverPermissions()
+  setInterval(() => w.expireStalePermissions(), 5_000)
   serve(w)
   chmodSync(SOCK, 0o600) // only this user can inject prompts
   console.error(new Date().toISOString(), `watcher ${process.pid} listening on ${SOCK}`)

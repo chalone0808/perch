@@ -737,11 +737,80 @@ test('sync stores the relay cursor token and device id, then sends them back', a
   w.sync({ server: `http://localhost:${server.port}`, token: 't' }, machine)
   while (seen.length < 2) await Bun.sleep(5)
   server.stop(true)
-  expect(seen[0].protocol).toBe(2)
+  expect(seen[0].protocol).toBe(PROTOCOL)
   expect(seen[0].cursor_token).toBeUndefined()
   expect(seen[1].cursor_token).toBe('r:d:5')
   expect(seen[1].after).toBe(5)
   expect(w.machineId).toBe('dev_abc')
   expect(w.get('device_id')).toBe('dev_abc')
   expect(w.get('cursor_token')).toBe('r:d:5')
+})
+
+test('a polled approval survives a watcher restart and returns the decision', async () => {
+  const path = join(mkdtempSync(join(tmpdir(), 'perch-perms-')), 'perch.db')
+  const w = new Watcher(path, { home: HOME })
+  w.permWaitMs = 5
+  w.sessionStart({ session_id: 's1', cwd: '/x', keys: '/tmp/k.sock' })
+  w.receive(msg('presence', { away: true }, null as any))
+  expect(await w.startPermission({
+    session_id: 's1', tool_name: 'Bash', tool_input: { command: 'ls' }, request_id: 'req-1',
+  })).toMatchObject({ request_id: 'req-1', status: 'pending' })
+  expect(out(w).filter((m) => m.type === 'needs_attention')).toHaveLength(1)
+
+  // A restart opens the same DB: the pending row is reused, not duplicated.
+  const w2 = new Watcher(path, { home: HOME })
+  w2.permWaitMs = 5
+  expect(await w2.startPermission({
+    session_id: 's1', tool_name: 'Bash', tool_input: { command: 'ls' }, request_id: 'req-1',
+  })).toMatchObject({ request_id: 'req-1', status: 'pending' })
+  expect((w2.db.query('select count(*) n from pending_perms').get() as any).n).toBe(1)
+  expect(out(w2).filter((m) => m.type === 'needs_attention')).toHaveLength(1)
+
+  w2.receive(msg('decision', { request_id: 'req-1', behavior: 'allow' }))
+  expect((await w2.startPermission({
+    session_id: 's1', tool_name: 'Bash', tool_input: { command: 'ls' }, request_id: 'req-1',
+  })).decision).toEqual({ behavior: 'allow' })
+})
+
+test('a decision wakes a held poll immediately', async () => {
+  const { w } = typing()
+  w.permWaitMs = 5000
+  const waiting = w.startPermission({ session_id: 's1', tool_name: 'Bash', tool_input: {}, request_id: 'req-2' })
+  await Bun.sleep(5)
+  w.receive(msg('decision', { request_id: 'req-2', behavior: 'allow' }))
+  expect((await waiting).decision).toEqual({ behavior: 'allow' })
+})
+
+test('a polled request expires when its hook stops asking, and stays expired', async () => {
+  const { w } = typing()
+  w.permWaitMs = 5
+  await w.startPermission({ session_id: 's1', tool_name: 'Bash', tool_input: {}, request_id: 'req-3' })
+  w.db.run('update pending_perms set last_poll = ? where id = ?', [Date.now() - 120_000, 'req-3'])
+  w.expireStalePermissions()
+  expect(out(w).find((m) => m.type === 'request_expired')?.body).toEqual({ request_id: 'req-3' })
+  expect(await w.startPermission({
+    session_id: 's1', tool_name: 'Bash', tool_input: {}, request_id: 'req-3',
+  })).toMatchObject({ status: 'expired' })
+  expect(out(w).filter((m) => m.type === 'needs_attention')).toHaveLength(1)
+})
+
+test('release hands a polled approval back to the terminal', async () => {
+  const { w } = typing()
+  w.permWaitMs = 5
+  await w.startPermission({ session_id: 's1', tool_name: 'Bash', tool_input: {}, request_id: 'req-4' })
+  w.releasePermissions()
+  expect(out(w).find((m) => m.type === 'request_expired')?.body).toEqual({ request_id: 'req-4' })
+  expect(await w.startPermission({
+    session_id: 's1', tool_name: 'Bash', tool_input: {}, request_id: 'req-4',
+  })).toMatchObject({ status: 'expired' })
+})
+
+test('a prompt sent instead denies a polled approval', async () => {
+  const { w } = typing()
+  w.permWaitMs = 5
+  await w.startPermission({ session_id: 's1', tool_name: 'Bash', tool_input: {}, request_id: 'req-5' })
+  w.receive(msg('prompt', { text: 'use git instead' }))
+  expect((await w.startPermission({
+    session_id: 's1', tool_name: 'Bash', tool_input: {}, request_id: 'req-5',
+  })).decision).toEqual({ behavior: 'deny', message: 'use git instead' })
 })
